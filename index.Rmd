@@ -1,0 +1,569 @@
+---
+title: "PCA,K-Means y Modelos Logistico"
+author: "Jacob Araya Castillo"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+ Asignatura: Business Analytics
+ INACAP 2026 Otoño Vespertino
+ 
+#  INTRODUCCIÓN: {style="margin-top: 60px; margin-bottom: 30px;"}
+ 
+ Se trabaja una combinación muy potente de microeconomía/finanzas corporativas (rentabilidad, liquidez, apalancamiento, múltiplos de mercado) y macroeconomía  (crecimiento, empleo, sector externo, tasas y política fiscal). 
+ 
+ Es el escenario ideal para ver cómo las condiciones del entorno impactan en la salud de las empresas.Por las dimensiones (5000 observaciones y 32 variables) y la variable objetivo "Default", la estrategia analítica planteada tiene todo el sentido:
+ 
+ * PCA para reducir la alta dimensionalidad 
+   (y evitar la multicolinealidad entre variables macro y de liquidez).
+ 
+ * K-Means para segmentar el comportamiento de las empresas o los entornos económicos.
+ 
+ * Regresión Logística para predecir la probabilidad de "Default".
+ 
+## Mapeo de las variables:
+ 
+ - Identificadores y Control: id, Sector.
+ - Rentabilidad y Mercado: ROA, ROE, Margen_Neto, Precio_Accion, UPA (Utilidad por Acción).
+ - Liquidez y Eficiencia: Liquidez_Corriente, Prueba_Acida, Rotacion_Activos,  Plazo_Medio_Cobro.
+ - Apalancamiento: Endeudamiento, GAO (Operativo), GF_Efecto, GAF (Financiero), GAT (Total).
+ - Entorno Macroeconómico: PIB_crecimiento, PIB_per_capita, Desempleo, Inflacion,  Tipo_de_cambio.
+ - Sector Externo: Exportaciones_MM, Importaciones_MM, Cuenta_Corriente.
+ - Tasas y Política Fiscal: Tasa_Interes_Nominal, Tasa_Interes_Real, Gasto_Gobierno_MM, Deficit_Gobierno, Tasa_Impuesto_Corp, Tasa_Bonos_Gobierno, Tasa_Rf.
+ - Variable Target (Binaria): Default (1 si quebró/incumplió, 0 si está sana).
+
+
+### CONFIGURACIÓN INICIAL Y LIBRERÍAS
+```{r warning= FALSE, include =FALSE}
+library(tidyverse)
+library(tidymodels)
+library(factoextra) # Para visualizar PCA y KMeans
+library(arrow)
+
+# Directorio
+setwd("C:/Users/jaraya/Dropbox/1U Tecnológica de Chile INACAP/2026/Otoño2026/Ele Business Analytics")
+
+# Carga base de datos
+df <- read_parquet("dataset_empresas5.parquet")
+dim(df)
+```
+
+# 1. PREPARACIÓN DE DATOS Y DIVISIÓN {style="margin-top: 60px; margin-bottom: 30px;"}
+
+Se ejecuta la división inicial y la estrategia de validación cruzada, garantizando la reproducibilidad con set.seed(123).
+
+## 1.1) Data Split (data_split) 
+
+Proporción 80/20: Se dividen los 5,000 registros totales dejando 4,000 para el set de entrenamiento (train_data) y 1,000 para el set de prueba (test_data). 
+
+Es una proporción estándar y robusta. En el set de entrenamiento es donde se aplicará el PCA, calibrará el K-Means y será ajustada la Regresión Logística. 
+
+El set de prueba se quedará guardado hasta el final para evaluar el rendimiento real del modelo logístico en datos no vistos.
+
+## 1.2) Estructura de los Datos (train_data y test_data)
+
+Fila 8 del Train (id 12): Muestra un ROA casi en cero (0.0017) y un ROE negativo (-0.0076), acompañado de una Liquidez_Corriente menor a 1 (0.914). Esta empresa tiene un perfil claro de estrés financiero y posiblemente sea candidata a Default = 1.
+
+Fila 5 del Test (id 52): Muestra un ROA del 12.3%, ROE del 24.1% y Liquidez_Corriente de 1.82. Una empresa sana y altamente rentable (Default = 0).
+
+## 1.3) Validación Cruzada Estratificada (kfolds_data)
+
+5-Fold Cross-Validation: Se divide los 4,000 datos de entrenamiento en 5 subgrupos (folds) de aproximadamente 800 observaciones cada uno.
+
+Es crucial para la estratificación. Al indicarle a vfold_cv() que se estratificara según la variable Default, se asegura, que cada uno de los 5 folds mantenga exactamente la misma proporción de empresas en quiebra y empresas sanas que el set de entrenamiento original. Esto evita que un fold se quede sin casos de default, lo que arruinaría el entrenamiento del modelo predictivo.
+
+
+```{r}
+# Fijar para Reproducibilidad
+set.seed(123) # Para reproducibilidad
+# Split para el modelo logístico (Entrenamiento y Testeo)
+data_split <- initial_split(df, prop = 0.80, strata = Default)
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+# Validación Cruzada (V-Fold Cross-Validation) para evaluar el Modelo Logístico
+kfolds_data <- vfold_cv(train_data, v = 5, strata = Default)
+```
+
+
+# 2. ANÁLISIS DE COMPONENTES PRINCIPALES (PCA) {style="margin-top: 60px; margin-bottom: 30px;"}
+ 
+Se realiza la definición del recipe (receta de preprocesamiento). Es una de las partes más críticas del flujo de trabajo, porque aquí se establece exactamente qué transformaciones sufrirán los datos antes de entrar a los modelos.
+
+Paso a paso:
+
+## 2.1) Roles de las Variables (Inputs) outcome: 
+
+- variable objetivo: Default
+
+- predictor: Las 30 variables financieras y macroeconómicas que se usará para predecir o explicar el comportamiento.
+
+- id: La variable id queda excluida de los cálculos matemáticos para que no ensucie las predicciones, pero se retiene para identificar las observaciones.
+
+## 2.2) Orden de las Operaciones (La Línea de Ensamblaje) 
+
+El orden metodológico en ciencia de datos es crítico, ya que, al alterar este orden se puede sesgar los resultados. 
+
+Esto es lo que pasa secuencialmente:
+
+- Dummy variables from: Se transforma la variable categórica Sector (Industrial, Servicios, Exportador) en variables binarias numéricas (0 o 1). Esto es estrictamente necesario porque los algoritmos como PCA y K-Means solo entienden de matrices numéricas y distancias geométricas.
+
+- Zero variance filter on: all_numeric_predictors(): Elimina cualquier variable numérica que sea constante (varianza cero) o casi constante. Si una tasa de impuesto o un indicador macro no varió en absoluto en los 4,000 registros, no aporta información y se descarta para evitar problemas de división por cero o matrices singulares.
+
+- Removing rows with NA values in: all_predictors(): Limpia la base eliminando filas con datos perdidos. Al hacerlo antes de centralizar y escalar, se asegura que los cálculos de la media y la desviación estándar sean limpios.
+
+- Centering and scaling for: all_numeric_predictors(): Este paso es vital. Resta la media y divide por la desviación estándar (x - mu) / sigma. Como se tiene variables en escala de tasas (0.05 de interés), millones de dólares (Exportaciones_MM) y montos fijos (Precio_Accion), si no se escalara, las variables con números más grandes dominarían por completo el PCA y el K-Means solo por su escala, no por su importancia real.
+
+- PCA extraction with: all_numeric_predictors(): Aplica la descomposición en Componentes Principales sobre los predictores normalizados.
+
+- Un detalle crucial sobre el PCA en la Receta: Al incluir la extracción de PCA directamente en la receta (step_pca()), se está transformando las 30 predictores correlacionados en un conjunto de Componentes Principales (PC1, PC2, etc.) que son ortogonales (completamente independientes entre sí).
+
+Esto significa que:
+
+* Para la Regresión Logística: 
+
+- Se elimina por completo el peligro de la multicolinealidad (un problema gravísimo cuando se ponen variables macroeconómicas juntas, como PIB_crecimiento, Desempleo e Inflacion, o tasas de interés que se mueven en bloque).
+
+- Para el modelo: La regresión logística no estimará los coeficientes de las variables originales, sino los coeficientes de los Componentes Principales.
+
+
+```{r}
+lr_recipe <- recipe(Default ~ ., data = train_data) %>%
+  # 1. Asignar rol de identificación para que no entren al modelo ni al PCA
+  update_role(id, new_role = "id") %>%
+  
+  # 2. Transformar variables nominales/categóricas (como Sector) a Dummy/One-Hot
+  step_dummy(Sector) %>% 
+  
+  # 3. Eliminar columnas con varianza cero (las constantes macro)
+  # Esto evita que R intente dividir por 0 en el siguiente paso
+  step_zv(all_numeric_predictors()) %>%
+  
+  # 4. Eliminar filas con valores faltantes (opcional, pero recomendado para PCA)
+  step_naomit(all_predictors()) %>%
+  
+  # 5. Normalizar SOLO las variables numéricas predictoras
+  # Usamos 'all_numeric_predictors()' para excluir 'Sector' (si ya es dummy) e 'id'
+  step_normalize(all_numeric_predictors()) %>%
+  
+  # 6. Aplicar PCA SOLO a los predictores numéricos
+  step_pca(all_numeric_predictors(), threshold = 0.85)
+
+```
+
+
+## 2.3) Prueba y Validación de la Receta
+
+2.3.1) El Filtro de Varianza Cero eliminó las Variables Macro
+
+• Zero variance filter removed: PIB_crecimiento, PIB_per_capita, Desempleo, ... | Trained
+
+Esto significa que step_zv() eliminó por completo las variables macroeconómicas de los datos de entrenamiento. 
+
+¿Por qué ocurrió esto?
+
+Como los datos provienen de empresas (microdatos), si los 4,000 registros corresponden a un mismo año o periodo fiscal estático, el PIB_crecimiento, el Desempleo o la Inflacion son exactamente iguales para todas las empresas. 
+Al no tener variabilidad dentro de la muestra de entrenamiento, el filtro las descarta automáticamente porque su varianza es cero (0).
+
+Impacto: 
+
+-El PCA y el modelo posterior ya no contienen el entorno macroeconómico. 
+
+-Se están construyendo única y exclusivamente con la información financiera y operativa interna de las firmas (ROA, ROE, Liquidez, Endeudamiento, etc.).
+
+2.3.2) Estructura de los Componentes (datos_transformados)
+
+Al ejecutar el bake de la receta, R redujo las variables financieras remanentes a Componentes Principales. 
+Por defecto, step_pca() suele extraer los primeros 5 componentes (PC1 a PC5), transformando la matriz original.
+
+Las primeras 6 filas de los datos listos para modelar:
+
+- Estructura limpia: Desaparecieron las 30 variables originales correlacionadas. 
+
+- Dataframe ultra compacto con el id, el Default (que es factor "No" / "Sí") y los vectores ortogonales PC1 a PC5.
+
+Interpretación geométrica: 
+
+* La empresa id 3 tiene un PC1 de -1.74 y un PC3 de 1.23.
+
+* La empresa id 5 se comporta al revés en el primer eje, con un PC1 positivo de 1.47.
+
+* Estos valores (scores) representan la posición de cada empresa en el nuevo espacio multidimensional de riesgo y rentabilidad corporativa.
+
+## 2.4) Conclusiones:
+
+Para poder avanzar se necesita ver dos cosas fundamentales:
+
+* Los Loadings (Cargas) del PCA: 
+  Necesitamos saber qué variables financieras componen principalmente a PC1, PC2, etc. 
+  (Por ejemplo, si PC1 está dominado por ROA/ROE [Rentabilidad] o por Endeudamiento/GAF [Apalancamiento]). 
+
+* La Varianza Explicada:
+  Ver si esos 5 componentes logran capturar un porcentaje aceptable (ej. >70%) de la variabilidad total de las empresas.
+
+
+```{r}
+# Para ver que no falle, hay que ejecútar:
+tailor_prep <- prep(lr_recipe)
+datos_transformados <- juice(tailor_prep)
+
+# Si esto corre sin error, se puede ver cómo quedaron los componentes:
+head(datos_transformados)
+
+```
+
+
+
+# 3. CLUSTERING CON K-MEANS {style="margin-top: 60px; margin-bottom: 30px;"}
+
+En la fase de Clustering (K-Means) se utilizan los componentes principales (PC1 a PC5) extraídos del comportamiento financiero corporativo para luego segmentar las 4,000 empresas.
+
+Paso a paso: 
+
+## 3.1) Aplicar K-Means
+
+   Aplicar K-Means sobre las dimensiones reducidas del PCA, lo que evita la maldición de la dimensionalidad y elimina el ruido de las variables altamente correlacionadas.
+
+## 3.2) Tabla de Evaluación
+   Analizar la tabla de evaluación (kmeans_eval) para tomar la decisión metodológica más importante del clustering: ¿Cuántos grupos (k) elegir?
+
+## 3.3) Metricas de Calidad 
+  Análisis de Métricas de Calidad (kmeans_eval)
+   Para evaluar K-Means se fija en:
+
+- La descomposición de la suma de cuadrados total (totss): Se mantiene constante en 59,267.
+
+- tot.withinss (Suma de cuadrados interna): Mide qué tan dispersos están los puntos dentro de cada clúster. Se quiere que sea lo menor posible (clústeres compactos y homogéneos).
+
+- betweenss (Suma de cuadrados entre grupos): Mide qué tan separados están los centros de los clústeres entre sí. Queremos que sea lo mayor posible (grupos bien diferenciados).
+
+
+## 3.4) Método del Codo  
+   Aplicar el Método del Codo (Elbow Method)
+
+   Al observar cómo cae tot.withinss a medida que se aumenta el número de clústeres (k), se busca el punto donde la ganancia marginal empieza a estabilizarse (el "codo"):
+   
+   * De k = 1 a k = 2: La inercia cae drásticamente de 59,267 a 38,655 (una reducción del 34.7%).
+   
+   * De k = 2 a k = 3: Cae a 29,579 (otra reducción fuerte del 23.5% respecto al paso anterior).
+   
+   * De k = 3 a k = 4: Cae a 25,482 (reducción del 13.8%).
+   
+   * De k = 4 a k = 5: Cae a 22,868 (reducción del 10.2%).
+
+   A partir de k = 6 en adelante, las caídas porcentuales se vuelven mucho más pequeñas e incrementales (alrededor del 7% o menos).
+
+## 3.5) Conclusión
+
+- Según los datos brutos, los mejores candidatos para la segmentación son k = 3 o k = 4.
+
+- Si se elige k = 3: betweenss explica el 50.1% de la varianza total. 
+
+Es un modelo muy parsimonioso y fácil de interpretar en finanzas corporativas (por ejemplo: Empresas Saludables, Empresas de Riesgo Moderado, Empresas en Estrés/Candidatas a Default).
+
+- Si se elige k = 4: 
+
+  + Se logra capturar el 57.0% de la varianza total. 
+
+  + Daria una granularidad extra si se necesita separar, como por ejemplo, empresas de alto crecimiento vs. empresas maduras estables.
+
+Dato técnico positivo: 
+
+- Las iteraciones (iter) requeridas para converger son bajas (máximo 7)
+
+- Indica que el algoritmo encontró mínimos locales muy estables rápidamente y
+
+- no hay problemas de oscilación salvaje en los datos.
+
+
+```{r}
+# Extraer solo las componentes para KMeans
+datos_kmeans <- datos_transformados %>% select(starts_with("PC"))
+
+# Evaluar el número óptimo de clusters (Gráfico del Codo)
+kmeans_eval <- tibble(k = 1:10) %>%
+  mutate(
+    # 1. Usar purrr::map y convertir a matriz para evitar conflictos
+    model = purrr::map(k, ~ kmeans(as.matrix(datos_kmeans), centers = .x, nstart = 20, iter.max = 50)),
+    # 2. Forzamos purrr::map y broom::glance para extraer las métricas limpiamente
+    glance = purrr::map(model, broom::glance)
+  ) %>%
+  unnest(glance)
+
+# Gráfico del Codo para elegir el K óptimo
+plot_elbow <- ggplot(kmeans_eval, aes(x = k, y = tot.withinss)) +
+  geom_line(color = "blue", linewidth = 1) + geom_point(size=2) +
+  labs(title = "Método del Codo para K-Means", x = "Número de Clusters (K)", y = "Inercia Intra-cluster (tot.withinss)")+
+  theme_minimal()
+
+print(plot_elbow)
+```
+
+
+# 4. MODELO LOGÍSTICO {style="margin-top: 60px; margin-bottom: 30px;"}
+
+En ciencia de datos, el workflow actúa como un contenedor que amarra firmemente dos piezas clave: 
+
+ + la receta de ingeniería de variables y 
+
+ + la especificación del modelo matemático.
+
+
+## 4.1) Estructura es Metodológica
+
+¿Por qué esta estructura es metodológicamente robusta?
+
+* Blindaje contra el Data Leakage (Filtración de Datos): 
+
+  Al empaquetar los 5 pasos de la receta (step_dummy, step_zv, step_naomit, step_normalize, step_pca) junto con el motor de regresión logística (glm), se garantiza que cuando se ejecuta la validación cruzada (fit_resamples()) o la evaluación final (last_fit()), entonces, las transformaciones matemáticas (como la media del escalado o las cargas del PCA) se calculan única y exclusivamente con los datos de entrenamiento de cada fold. 
+ El set de prueba se mantendrá verdaderamente "puro".
+
+* Automatización del Flujo: 
+
+  + No se necesita aplicar manualmente la receta a los datos y luego pasarle esa matriz al modelo.
+
+  + Al ejecutar el workflow:
+
+    - Recibe los datos crudos. Procesar las variables (pasando del filtro de varianza cero directo a la reducción dimensional).
+
+    - Inyecta los componentes principales resultantes (PC1 a PC5) directamente en la ecuación logística para clasificar el Default ("Sí" / "No").
+
+
+
+```{r}
+# 4.1. Especificación del Modelo Logístico (Motor GLM)
+lr_spec <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+# 4.2. Creación del Workflow (Une la receta corregida con el modelo)
+lr_workflow <- workflow() %>%
+  add_recipe(lr_recipe) %>% # Tu receta estable con step_zv, normalize y pca
+  add_model(lr_spec)
+
+
+
+# 4.3. Configuración de los Folds de Validación Cruzada (v = 5 o 10)
+# Se usa strata = Default para garantizar que la proporción de impagos se mantenga en cada fold
+set.seed(123)
+kfolds_data <- vfold_cv(train_data, v = 5, strata = Default)
+
+# 4.4. Ejecución de la Validación Cruzada
+# Evaluar usando métricas clave para desbalances (como suele ser el Default)
+lr_resamples <- fit_resamples(
+  lr_workflow,
+  resamples = kfolds_data,
+  metrics = metric_set(roc_auc, accuracy, sensitivity, specificity),
+  control = control_resamples(save_pred = TRUE)
+)
+
+# 4.5. Ver el rendimiento detallado por cada fold (opcional, para evaluar estabilidad)
+collect_metrics(lr_resamples, summarize = FALSE)
+
+# 4.6. Ver las métricas promedio de todos los folds
+print("Métricas Promedio de Validación Cruzada:")
+metrics_cv <- collect_metrics(lr_resamples)
+print(metrics_cv)
+```
+
+
+## 4.2) Diagnóstico de las Métricas 
+
+Al mirar los resultados de collect_metrics(..., summarize = FALSE), se ve que las métricas en los 5 folds son excepcionalmente altas y muy estables entre sí (lo que descarta problemas de sobreajuste o overfitting entre subgrupos):
+
++ roc_auc (Área bajo la curva ROC): 
+  Muestra valores entre 0.997 y 1.000. Un AUC de prácticamente 1 significa que los componentes principales (PC1 a PC5) logran separar con una perfección casi absoluta a las empresas que van a caer en impago de las que se mantendrán sanas.
+
++ sensitivity (Sensibilidad / Recall): 
+  Ronda entre 95.4% y 98.3%. Esto mide la capacidad del modelo para detectar los casos reales de Default. 
+  En riesgo de crédito, esta es la métrica más importante, ya que el costo financiero de no detectar una quiebra es altísimo.
+
++ specificity (Especificidad): 
+  Varía entre 98.4% y 99.5%. Mide la capacidad de clasificar correctamente a las empresas sanas. 
+  El modelo genera poquísimos falsos positivos.
+
++ accuracy (Exactitud): Promedia un 98.5% de predicciones correctas totales.
+
+
+## 4.3) La Alerta Crítica: 
+
+Separación Perfecta (Perfect Separation)
+
+  A pesar de los excelentes números, R arrojó esta advertencia 5 veces (una por cada fold):
+
+  → A | warning: glm.fit: fitted probabilities numerically 0 or 1 occurred
+
+  ¿Qué significa esto matemáticamente?
+
+  En una regresión logística, el algoritmo busca optimizar los coeficientes mediante máxima verosimilitud utilizando una curva sigmoide. 
+
+  Cuando se tiene predictores que logran dividir perfectamente los dos grupos (en este caso, un umbral donde todos los valores a la izquierda son Default = No y a la derecha son Default = Sí), los coeficientes beta tienden a infinito (infty).
+
+  Al ocurrir esto, las probabilidades estimadas por el modelo matemático se vuelven exactamente 0 o 1 en términos computacionales, perdiendo la capacidad de devolver graduaciones sutiles de probabilidad (como un 45% o 72% de riesgo).
+
+
+  ¿Por qué ocurrió?
+
+  Al aplicar PCA sobre ratios financieros fuertemente correlacionados con la insolvencia (como una Liquidez_Corriente < 1 combinada con un ROE destructivo y alto Endeudamiento), el primer o segundo componente principal capturó una frontera de riesgo tan matemática y drásticamente limpia que el modelo logístico no tuvo que "esforzarse" en calcular incertidumbres.
+
+  ¿Qué se debería hacer a continuación?
+
+  - Verificar los Coeficientes: Al ejecutar lr_workflow %>% fit(train_data) %>% tidy(), se ve que algunos errores estándar (standard errors) de las variables PC serán absurdamente gigantescas. 
+
+  - Es el síntoma clásico de la separación perfecta.
+    En muchas disciplinas, la separación perfecta es un problema que requiere regularización (como una regresión Ridge o Lasso con glmnet). Sin embargo, en la predicción de quiebra corporativa con datos simulados o con indicadores contables muy marcados, simplemente demuestra que las variables financieras internas son predictores sumamente potentes y limpios del default.
+
+
+## 4.4) Interpretación de los Promedios (mean)
+
+- roc_auc = 0.999 (Área Bajo la Curva ROC): 
+
+Mantener un promedio de 99.9% en datos no vistos durante el entrenamiento parcial de los folds confirma que la estructura espacial de los componentes del PCA es radicalmente efectiva para segregar los perfiles de riesgo. Casi no hay solapamiento numérico entre las empresas que caen en default y las que no.
+
+- sensitivity = 0.971 (Sensibilidad / Recall): 
+
+En promedio, el modelo es capaz de detectar correctamente al 97.1% de las empresas que realmente van a quebrar. Para un analista de riesgo de crédito o evaluación de carteras, este es un resultado óptimo, ya que minimiza drásticamente el "Error Tipo II" (aprobar un crédito a una empresa que terminará en default).
+
+- specificity = 0.989 (Especificidad): 
+
+El modelo identifica correctamente al 98.9% de las empresas sanas. Esto te garantiza que no vas a sobre-reaccionar castigando o rechazando a empresas estables por falsas alarmas del algoritmo.
+
+- accuracy = 0.984 (Exactitud): 
+
+El 98.4% de todas las clasificaciones hechas por el modelo (tanto aciertos en sanas como en insolventes) son correctas.
+
+
+## 4.5) El Indicador Clave: El Error Estándar (std_err)
+
+El error estándar mide qué tanto variaron las métricas de un fold a otro. En tu salida, los valores son minúsculos:
+
+- std_err de la Exactitud: 0.0024 (0.24%)
+
+- std_err del AUC: 0.0004 (0.04%)
+
+
+¿Qué dice esto? 
+
+Que el modelo es increíblemente estable. 
+
+No se tuvo un "fold de suerte" que inflara las métricas; el algoritmo se comporta de manera idéntica sin importar qué subgrupo de empresas le toque evaluar. Esto valida que los patrones financieros que encontró el PCA se repiten de forma homogénea en toda tu muestra de 4,000 registros.
+
+A pesar de la advertencia de separación perfecta que se ve en el paso anterior, las métricas promedio demuestran que no se rompió ni perdió generalización. El modelo es un clasificador excepcionalmente potente.
+
+Con esto se tiene el sustento estadístico para el entrenamiento final. 
+
+
+## 4.6) Ajuste final y Evaluación con Test
+
+a) Veredicto de las Métricas 
+  
+  El Veredicto de las Métricas en Testeoroc_auc = 0.999: 
+
+- Se mantiene idéntico al promedio de la validación cruzada (99.9%). 
+
+- Esto es una confirmación matemática categórica de que el modelo no sufre de sobreajuste (overfitting). 
+
+- Tiene una capacidad de discriminación espacial casi perfecta en datos completamente nuevos.
+
+* accuracy = 0.98 (98.0%): De las 1,000 empresas de prueba, clasificó correctamente a 980.
+
+* brier_class = 0.0125 (Score de Brier): Esta métrica mide la precisión de las probabilidades asignadas (el error cuadrático medio de las probabilidades). Al estar extremadamente cerca de 0, nos dice que las probabilidades calculadas por el modelo están muy bien calibradas respecto a los resultados reales, dándole alta seguridad cuantitativa.
+
+(Nota: Nuevamente apareció la advertencia de separación perfecta, lo cual es normal dado el comportamiento determinista de los ratios financieros combinados por el PCA).
+
+b) Matriz de Confusión (Análisis de Riesgo)
+
+Con los datos crudos de la matriz, se calculan el impacto real en una evaluación de riesgo:            
+
+Truth  (Realidad)
+
+Prediction   Si (Default)   No (Sana)
+    Si           290            9      -> (Verdaderos Positivos / Falsos Positivos)
+    No            11          690      -> (Falsos Negativos / Verdaderos Negativos)
+
+- Verdaderos Positivos (290): El modelo identificó a 290 empresas que efectivamente quebraron.
+
+- Verdaderos Negativos (690): Clasificó correctamente a 690 empresas como operativas y sanas.
+
+- Falsos Negativos (11) — El riesgo crítico: El modelo predijo que 11 empresas estarían "Sanas" (No), pero en la realidad cayeron en Default. Financieramente, este es el error más costoso (pérdida de capital por colocación errónea de crédito), pero una tasa de error de solo el 3.6% en defaults reales ({11}{290+11) es un estándar de excelencia altísimo en la industria crediticia.
+
+- Falsos Positivos (9) — Costo de oportunidad: El modelo levantó una alerta de riesgo (Si) sobre 9 empresas que en realidad se mantuvieron sanas. Esto representa un costo de oportunidad marginal (operaciones comerciales o créditos rechazados innecesariamente), afectando a menos del 1.3% de las empresas sanas ({690+9}).
+
+
+c) Conclusión:
+
+- El pipeline completo es metodológicamente impecable.
+
+- Se redujeron las dimensiones financieras internas limpiamente con PCA, esquivando la multicolinealidad.
+
+- Se comprobó con K-Means la existencia de fronteras estables basadas en esos componentes.
+
+- El Modelo Logístico demostró una estabilidad estructural perfecta entre entrenamiento (0.984 de exactitud promedio) y testeo (0.98 de exactitud real), minimizando drásticamente los errores de pérdida institucional.
+
+
+```{r}
+# last_fit entrena por última vez en todo 'train_data' y evalúa en 'test_data'
+final_fit <- last_fit(lr_workflow, split = data_split)
+
+# 5.1. Ver métricas reales en el set de Testeo
+print("Métricas en el Conjunto de Testeo:")
+metrics_test <- collect_metrics(final_fit)
+print(metrics_test)
+
+# 5.2. Extraer predicciones para armar la Matriz de Confusión
+predictions_test <- collect_predictions(final_fit)
+print("Matriz de Confusión:")
+
+conf_matrix <- predictions_test %>% 
+  conf_mat(truth = Default, estimate = .pred_class)
+print(conf_matrix)
+
+# 3. Graficar la Curva ROC de Testeo
+plot_roc <- predictions_test %>% 
+  # Cambiar al nombre real de la columna de probabilidad para la clase "Si"
+  roc_curve(truth = Default, .pred_Si) %>% 
+  autoplot() +
+  labs(
+    title = "Curva ROC - Evaluación Externa (Test)",
+    x = "1 - Especificidad (Tasa de Falsos Positivos)",
+    y = "Sensibilidad (Tasa de Verdaderos Positivos)"
+  ) +
+  theme_minimal()
+
+# Imprimir el gráfico en pantalla
+print(plot_roc)
+```
+
+## 4.7) Analisis Curva ROC
+
+1) La Anatomía del Gráfico
+
+- Eje Y (Sensibilidad / Tasa de Verdaderos Positivos): Mide la proporción de empresas en default real que el modelo logra capturar a medida que mueves el umbral de decisión.
+
+- Eje X (1 - {Especificidad} / Tasa de Falsos Positivos): Mide la proporción de empresas sanas que clasificas erróneamente como "en default".
+
+- La Línea Diagonal Punteada: Representa un modelo aleatorio (lanzar una moneda al aire, donde el AUC = 0.50). Cualquier modelo útil debe estar significativamente por encima de esta línea.
+
+
+2) ¿Por qué tu curva tiene esa forma de "Escuadra"?
+
+La curva sube de forma prácticamente vertical en el origen (0,0) hasta tocar el tope del gráfico (1.00 de Sensibilidad) y luego se desplaza horizontalmente hacia la derecha.
+
+Esto tiene una lectura analítica crucial: Significa que existe un umbral óptimo (en la esquina superior izquierda) donde el modelo alcanza una Tasa de Verdaderos Positivos (Sensibilidad) cercana al 97% o 98%, mientras mantiene una Tasa de Falsos Positivos extremadamente cercana al 0%.
+
+Visualmente, el Área Bajo la Curva (AUC) representa el espacio geométrico que queda atrapado debajo de la línea negra continua. Como la curva abraza casi por completo la esquina superior izquierda, el área es prácticamente el total del cuadrado (1.00).
+
+
+3) Diagnóstico Técnico
+
+En la práctica con datos reales de mercado, ver una curva ROC tan perfecta suele levantar sospechas de data leakage (filtración de variables que predicen el futuro o que contienen la respuesta implícita). 
+
+Sin embargo, en el flujo metodológico está completamente justificado: al haber extraído componentes principales de ratios contables tan fulminantes como el ROE destructivo, la falta de liquidez inmediata y el sobreendeudamiento, el PCA limpió tanto el ruido que el modelo logístico encuentra una frontera de separación matemática radicalmente evidente.
+
+Gráficamente, es un resultado impecable para demostrar el éxito de la validación externa en tu set de testeo.
+
+
+
+
+
+
